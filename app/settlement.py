@@ -30,34 +30,30 @@ def minimize_transactions(
 
     Approach
     --------
-    The algorithm uses backtracking.
+    The algorithm first uses exact backtracking to determine the
+    minimum possible number of transactions.
 
-    At every step, we select the first user with a non-zero balance
-    and try settling that user with every possible user having the
-    opposite balance.
+    A greedy settlement is then generated separately. If the greedy
+    plan uses the same minimum number of transactions, it is returned
+    because it produces practical transactions where no payer pays
+    more than their remaining debt.
 
-    The selected user is completely settled in each recursive branch.
-    We explore all possible creditor/debtor choices and keep the plan
-    requiring the fewest transactions.
-
-    Equal and opposite balances are handled naturally in one
-    transaction.
+    If greedy cannot achieve the minimum transaction count, the exact
+    backtracking solution is returned.
 
     Money is converted to integer paise before calculation to avoid
     floating-point precision problems.
 
     Time Complexity
     ---------------
-    Worst case: exponential, approximately O(n!), where n is the
-    number of users with non-zero balances.
+    Exact backtracking: exponential in the number of users with
+    non-zero balances.
 
-    This is suitable for small hostel/PG groups and allows us to find
-    a minimum-transaction settlement plan rather than relying on a
-    greedy approximation.
+    Greedy settlement: O(n log n), dominated by sorting.
 
     Space Complexity
     ----------------
-    O(n) recursion depth, excluding the stored settlement plan.
+    O(n) for the working balance lists and recursion depth.
     """
 
     # Convert rupees to integer paise for exact calculations.
@@ -66,6 +62,12 @@ def minimize_transactions(
         for user_id, balance in balances.items()
         if round(balance * 100) != 0
     ]
+
+    # A valid settlement must have total balance equal to zero.
+    if sum(balance for _, balance in working_balances) != 0:
+        raise ValueError(
+            "Invalid balances: total balance must be zero."
+        )
 
     best_plan: List[Tuple[int, int, int]] = []
 
@@ -143,9 +145,88 @@ def minimize_transactions(
             if updated[i][1] == 0:
                 break
 
+    # Find the exact minimum-transaction solution.
     backtrack(0, working_balances, [])
+
+    exact_plan = [
+        (payer, receiver, amount / 100)
+        for payer, receiver, amount in best_plan
+    ]
+
+    # Generate a practical greedy solution.
+    greedy_plan = greedy_settlement(balances)
+
+    # If greedy achieves the exact minimum transaction count,
+    # prefer it because its transactions never overshoot a payer's debt.
+    if len(greedy_plan) == len(exact_plan):
+        return greedy_plan
+
+    # Otherwise, preserve the exact optimal solution.
+    return exact_plan
+
+
+def greedy_settlement(
+    balances: Dict[int, float],
+) -> List[Tuple[int, int, float]]:
+    """
+    Create a practical settlement plan using greedy matching.
+
+    The largest debtor is matched with the largest creditor.
+    Each transaction uses the smaller of the remaining debt
+    and remaining credit.
+
+    Therefore, a payer never pays more than their remaining debt.
+    """
+
+    # Convert rupees to integer paise.
+    debtors = [
+        [user_id, round(-balance * 100)]
+        for user_id, balance in balances.items()
+        if round(balance * 100) < 0
+    ]
+
+    creditors = [
+        [user_id, round(balance * 100)]
+        for user_id, balance in balances.items()
+        if round(balance * 100) > 0
+    ]
+
+    # Sort largest amounts first.
+    debtors.sort(key=lambda x: x[1], reverse=True)
+    creditors.sort(key=lambda x: x[1], reverse=True)
+
+    transactions: List[Tuple[int, int, int]] = []
+
+    debtor_index = 0
+    creditor_index = 0
+
+    while (
+        debtor_index < len(debtors)
+        and creditor_index < len(creditors)
+    ):
+        debtor_id, debt = debtors[debtor_index]
+        creditor_id, credit = creditors[creditor_index]
+
+        # Never transfer more than either side needs.
+        amount = min(debt, credit)
+
+        transactions.append(
+            (debtor_id, creditor_id, amount)
+        )
+
+        # Update remaining amounts.
+        debtors[debtor_index][1] -= amount
+        creditors[creditor_index][1] -= amount
+
+        # Move to the next debtor if this debt is fully paid.
+        if debtors[debtor_index][1] == 0:
+            debtor_index += 1
+
+        # Move to the next creditor if this credit is fully satisfied.
+        if creditors[creditor_index][1] == 0:
+            creditor_index += 1
 
     return [
         (payer, receiver, amount / 100)
-        for payer, receiver, amount in best_plan
+        for payer, receiver, amount in transactions
     ]

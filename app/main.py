@@ -1,6 +1,18 @@
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
+from sqlalchemy.orm import Session
+from sqlalchemy import select
+from app.database import SessionLocal
+from app.db_models import (
+    GroupDB,
+    GroupMemberDB,
+    UserDB,
+    ExpenseDB,
+    ExpenseSplitDB,
+    RecurringExpenseDB,
+    RecurringExpenseSplitDB,
+)
 
 from app.models import User, Group, Expense, RecurringExpense
 from app.settlement import minimize_transactions
@@ -12,17 +24,19 @@ app = FastAPI(
     description="Group expense splitter for hostel and PG roommates",
     version="0.3.0",
 )
-
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 # ---------------------------------------------------------
-# Temporary in-memory storage
-# PostgreSQL will replace this later.
+# PostgreSQL database storage
 # ---------------------------------------------------------
 
-users: dict[int, User] = {}
-groups: dict[int, Group] = {}
-expenses: dict[int, Expense] = {}
-recurring_expenses: dict[int, RecurringExpense] = {}
+# Application data is stored in PostgreSQL
+# using SQLAlchemy models.
 
 
 # ---------------------------------------------------------
@@ -47,119 +61,253 @@ def health_check():
 # ---------------------------------------------------------
 
 @app.post("/groups")
-def create_group(group: Group):
+def create_group(group: Group, db: Session = Depends(get_db)):
+    existing = db.get(GroupDB, group.id)
 
-    if group.id in groups:
+    if existing:
         raise HTTPException(
             status_code=400,
             detail="Group already exists",
         )
 
-    groups[group.id] = group
+    db_group = GroupDB(
+        id=group.id,
+        name=group.name,
+    )
+
+    db.add(db_group)
+
+    for user_id in group.member_ids:
+        member = GroupMemberDB(
+            group_id=group.id,
+            user_id=user_id,
+        )
+        db.add(member)
+
+    db.commit()
 
     return group
 
+@app.post("/users")
+def create_user(user: User, db: Session = Depends(get_db)):
+    existing = db.get(UserDB, user.id)
 
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="User already exists",
+        )
+
+    db_user = UserDB(
+        id=user.id,
+        name=user.name,
+        email=user.email,
+    )
+
+    db.add(db_user)
+    db.commit()
+
+    return user
 # ---------------------------------------------------------
 # Recurring Expense endpoints
 # ---------------------------------------------------------
 
 @app.post("/recurring-expenses")
-def create_recurring_expense(recurring: RecurringExpense):
+def create_recurring_expense(
+    recurring: RecurringExpense,
+    db: Session = Depends(get_db),
+):
+    # Check that the group exists.
+    group = db.get(GroupDB, recurring.group_id)
 
-    # Check that group exists
-    if recurring.group_id not in groups:
+    if not group:
         raise HTTPException(
             status_code=404,
             detail="Group not found",
         )
 
-    # Check duplicate recurring expense
-    if recurring.id in recurring_expenses:
+    # Check that the payer exists.
+    payer = db.get(UserDB, recurring.paid_by)
+
+    if not payer:
+        raise HTTPException(
+            status_code=404,
+            detail="Payer not found",
+        )
+
+    # Check that the recurring expense ID is not already used.
+    existing = db.get(RecurringExpenseDB, recurring.id)
+
+    if existing:
         raise HTTPException(
             status_code=400,
             detail="Recurring expense already exists",
         )
 
-    # Check that all split users belong to the group
-    group_members = set(groups[recurring.group_id].member_ids)
+    # Check that the payer belongs to the group.
+    payer_membership = (
+        db.query(GroupMemberDB)
+        .filter(
+            GroupMemberDB.group_id == recurring.group_id,
+            GroupMemberDB.user_id == recurring.paid_by,
+        )
+        .first()
+    )
 
-    for user_id in recurring.split_user_ids:
-        if user_id not in group_members:
-            raise HTTPException(
-                status_code=400,
-                detail=f"User {user_id} is not a member of this group",
-            )
-
-    # Check that payer belongs to the group
-    if recurring.paid_by not in group_members:
+    if not payer_membership:
         raise HTTPException(
             status_code=400,
             detail="Payer is not a member of this group",
         )
 
-    # Store recurring expense
-    recurring_expenses[recurring.id] = recurring
+    # At least one person must share the recurring expense.
+    if not recurring.split_user_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one split participant is required",
+        )
 
-    return recurring
+    # Check that every split participant belongs to the group.
+    for user_id in recurring.split_user_ids:
+        membership = (
+            db.query(GroupMemberDB)
+            .filter(
+                GroupMemberDB.group_id == recurring.group_id,
+                GroupMemberDB.user_id == user_id,
+            )
+            .first()
+        )
 
+        if not membership:
+            raise HTTPException(
+                status_code=400,
+                detail=f"User {user_id} is not a member of this group",
+            )
 
-def generate_next_expense(recurring: RecurringExpense) -> Expense:
-    """
-    Convert a recurring expense into a normal expense.
-    """
-
-    expense = Expense(
-        id=max(expenses.keys(), default=0) + 1,
+    # Create recurring expense template.
+    db_recurring = RecurringExpenseDB(
+        id=recurring.id,
         group_id=recurring.group_id,
         description=recurring.description,
         amount=recurring.amount,
         paid_by=recurring.paid_by,
-        created_at=datetime.now(),
-        is_recurring=True,
-        split_user_ids=recurring.split_user_ids,
+        frequency=recurring.frequency,
+        next_due_date=recurring.next_due_date,
     )
 
-    return expense
+    db.add(db_recurring)
+
+    # Store the users who share the recurring expense.
+    for user_id in recurring.split_user_ids:
+        split = RecurringExpenseSplitDB(
+            recurring_expense_id=recurring.id,
+            user_id=user_id,
+        )
+        db.add(split)
+
+    db.commit()
+
+    return recurring
 
 
 @app.post("/recurring-expenses/{recurring_id}/generate")
-def generate_recurring_expense(recurring_id: int):
+def generate_recurring_expense(
+    recurring_id: int,
+    db: Session = Depends(get_db),
+):
+    # Get the recurring expense template.
+    recurring = db.get(RecurringExpenseDB, recurring_id)
 
-    # Find recurring expense
-    if recurring_id not in recurring_expenses:
+    if not recurring:
         raise HTTPException(
             status_code=404,
             detail="Recurring expense not found",
         )
 
-    recurring = recurring_expenses[recurring_id]
+    # Find the next available expense ID.
+    last_expense = (
+        db.query(ExpenseDB)
+        .order_by(ExpenseDB.id.desc())
+        .first()
+    )
 
-    # Generate normal expense
-    expense = generate_next_expense(recurring)
+    next_expense_id = (
+        last_expense.id + 1
+        if last_expense
+        else 1
+    )
 
-    # Store generated expense
-    expenses[expense.id] = expense
+    # Get the users who share this recurring expense.
+    split_records = (
+        db.query(RecurringExpenseSplitDB)
+        .filter(
+            RecurringExpenseSplitDB.recurring_expense_id
+            == recurring_id
+        )
+        .all()
+    )
 
-    # Update next due date
-    if recurring.frequency == "monthly":
-        recurring.next_due_date = (
-            recurring.next_due_date + relativedelta(months=1)
+    split_user_ids = [
+        split.user_id
+        for split in split_records
+    ]
+
+    if not split_user_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="Recurring expense has no split participants",
         )
 
-    elif recurring.frequency == "weekly":
-        recurring.next_due_date = (
-            recurring.next_due_date + relativedelta(weeks=1)
+    # Create a normal expense from the recurring template.
+    db_expense = ExpenseDB(
+        id=next_expense_id,
+        group_id=recurring.group_id,
+        description=recurring.description,
+        amount=recurring.amount,
+        paid_by=recurring.paid_by,
+        created_at=datetime.now(),
+        is_recurring=1,
+    )
+
+    db.add(db_expense)
+
+    # Store the split participants.
+    for user_id in split_user_ids:
+        split = ExpenseSplitDB(
+            expense_id=next_expense_id,
+            user_id=user_id,
+        )
+        db.add(split)
+
+    # Move the recurring template to its next cycle.
+    if recurring.frequency.lower() == "monthly":
+        recurring.next_due_date += relativedelta(months=1)
+
+    elif recurring.frequency.lower() == "weekly":
+        recurring.next_due_date += relativedelta(weeks=1)
+
+    elif recurring.frequency.lower() == "daily":
+        recurring.next_due_date += relativedelta(days=1)
+
+    elif recurring.frequency.lower() == "yearly":
+        recurring.next_due_date += relativedelta(years=1)
+
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported recurring frequency",
         )
 
-    elif recurring.frequency == "daily":
-        recurring.next_due_date = (
-            recurring.next_due_date + relativedelta(days=1)
-        )
+    db.commit()
 
     return {
-        "recurring_id": recurring_id,
-        "generated_expense": expense,
+        "id": next_expense_id,
+        "group_id": recurring.group_id,
+        "description": recurring.description,
+        "amount": recurring.amount,
+        "paid_by": recurring.paid_by,
+        "is_recurring": True,
+        "split_user_ids": split_user_ids,
         "next_due_date": recurring.next_due_date,
     }
 
@@ -169,45 +317,99 @@ def generate_recurring_expense(recurring_id: int):
 # ---------------------------------------------------------
 
 @app.post("/expenses")
-def create_expense(expense: Expense):
+def create_expense(
+    expense: Expense,
+    db: Session = Depends(get_db),
+):
+    # Check that the group exists.
+    group = db.get(GroupDB, expense.group_id)
 
-    if expense.id in expenses:
-        raise HTTPException(
-            status_code=400,
-            detail="Expense already exists",
-        )
-
-    if expense.group_id not in groups:
+    if not group:
         raise HTTPException(
             status_code=404,
             detail="Group not found",
         )
 
-    # Make sure all split participants belong to the group
-    group_members = set(groups[expense.group_id].member_ids)
+    # Check that the payer exists.
+    payer = db.get(UserDB, expense.paid_by)
 
-    for user_id in expense.split_user_ids:
-        if user_id not in group_members:
-            raise HTTPException(
-                status_code=400,
-                detail=f"User {user_id} is not a member of this group",
-            )
+    if not payer:
+        raise HTTPException(
+            status_code=404,
+            detail="Payer not found",
+        )
 
-    # Make sure payer belongs to the group
-    if expense.paid_by not in group_members:
+    # Check that the expense ID is not already used.
+    existing = db.get(ExpenseDB, expense.id)
+
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="Expense already exists",
+        )
+
+    # Check that the payer belongs to the group.
+    payer_membership = (
+        db.query(GroupMemberDB)
+        .filter(
+            GroupMemberDB.group_id == expense.group_id,
+            GroupMemberDB.user_id == expense.paid_by,
+        )
+        .first()
+    )
+
+    if not payer_membership:
         raise HTTPException(
             status_code=400,
             detail="Payer is not a member of this group",
         )
 
-    # At least one person must be included
+    # At least one person must share the expense.
     if not expense.split_user_ids:
         raise HTTPException(
             status_code=400,
             detail="At least one split participant is required",
         )
 
-    expenses[expense.id] = expense
+    # Check every split participant belongs to the group.
+    for user_id in expense.split_user_ids:
+        membership = (
+            db.query(GroupMemberDB)
+            .filter(
+                GroupMemberDB.group_id == expense.group_id,
+                GroupMemberDB.user_id == user_id,
+            )
+            .first()
+        )
+
+        if not membership:
+            raise HTTPException(
+                status_code=400,
+                detail=f"User {user_id} is not a member of this group",
+            )
+
+    # Create the expense.
+    db_expense = ExpenseDB(
+        id=expense.id,
+        group_id=expense.group_id,
+        description=expense.description,
+        amount=expense.amount,
+        paid_by=expense.paid_by,
+        created_at=expense.created_at,
+        is_recurring=1 if expense.is_recurring else 0,
+    )
+
+    db.add(db_expense)
+
+    # Store each person sharing the expense.
+    for user_id in expense.split_user_ids:
+        split = ExpenseSplitDB(
+            expense_id=expense.id,
+            user_id=user_id,
+        )
+        db.add(split)
+
+    db.commit()
 
     return expense
 
@@ -216,39 +418,53 @@ def create_expense(expense: Expense):
 # Balance calculation
 # ---------------------------------------------------------
 
-def calculate_group_balances(group_id: int):
-
+def calculate_group_balances(group_id: int, db: Session):
     """
-    Calculate the net balance of every member in a group.
+    Calculate net balances using PostgreSQL data.
 
-    Positive balance:
-        The user should receive money.
-
-    Negative balance:
-        The user owes money.
-
-    Each expense is split equally among
-    the users listed in split_user_ids.
+    Positive balance = user should receive money.
+    Negative balance = user owes money.
     """
+
+    # Get all members of the group.
+    memberships = (
+        db.query(GroupMemberDB)
+        .filter(GroupMemberDB.group_id == group_id)
+        .all()
+    )
 
     balances = {
-        user_id: 0.0
-        for user_id in groups[group_id].member_ids
+        membership.user_id: 0.0
+        for membership in memberships
     }
 
-    for expense in expenses.values():
+    # Get all expenses belonging to this group.
+    group_expenses = (
+        db.query(ExpenseDB)
+        .filter(ExpenseDB.group_id == group_id)
+        .all()
+    )
 
-        if expense.group_id != group_id:
-            continue
+    for expense in group_expenses:
 
-        # Person who paid gets credit for full amount
+        # The payer gets credit for the full amount.
         balances[expense.paid_by] += expense.amount
 
-        # Divide expense equally
-        share = expense.amount / len(expense.split_user_ids)
+        # Find everyone sharing this expense.
+        splits = (
+            db.query(ExpenseSplitDB)
+            .filter(ExpenseSplitDB.expense_id == expense.id)
+            .all()
+        )
 
-        for user_id in expense.split_user_ids:
-            balances[user_id] -= share
+        if not splits:
+            continue
+
+        # Current SplitUp rule: divide equally.
+        share = expense.amount / len(splits)
+
+        for split in splits:
+            balances[split.user_id] -= share
 
     return balances
 
@@ -258,36 +474,43 @@ def calculate_group_balances(group_id: int):
 # ---------------------------------------------------------
 
 @app.get("/groups/{group_id}/balances")
-def get_group_balances(group_id: int):
+def get_group_balances(
+    group_id: int,
+    db: Session = Depends(get_db),
+):
+    group = db.get(GroupDB, group_id)
 
-    if group_id not in groups:
+    if not group:
         raise HTTPException(
             status_code=404,
             detail="Group not found",
         )
 
-    balances = calculate_group_balances(group_id)
+    balances = calculate_group_balances(group_id, db)
 
     return {
         "group_id": group_id,
         "balances": balances,
     }
 
-
 # ---------------------------------------------------------
 # Settlement endpoint
 # ---------------------------------------------------------
 
 @app.get("/groups/{group_id}/settlement")
-def get_settlement(group_id: int):
+def get_settlement(
+    group_id: int,
+    db: Session = Depends(get_db),
+):
+    group = db.get(GroupDB, group_id)
 
-    if group_id not in groups:
+    if not group:
         raise HTTPException(
             status_code=404,
             detail="Group not found",
         )
 
-    balances = calculate_group_balances(group_id)
+    balances = calculate_group_balances(group_id, db)
 
     settlement = minimize_transactions(balances)
 

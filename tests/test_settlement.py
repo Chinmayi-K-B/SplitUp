@@ -1,4 +1,4 @@
-from app.settlement import minimize_transactions
+from app.settlement import minimize_transactions, greedy_settlement
 
 
 def test_two_person_split():
@@ -41,3 +41,33 @@ def test_already_settled_group():
     result = minimize_transactions(balances)
 
     assert result == []
+
+def test_transactions_do_not_exceed_debt():
+    balances = {
+        1: 900.0,
+        2: -300.0,
+        3: -300.0,
+        4: -300.0,
+    }
+
+    result = minimize_transactions(balances)
+
+    # No payer should be asked to pay more than they owe.
+    for payer, _, amount in result:
+        assert amount <= -balances[payer]
+
+def test_greedy_settlement_does_not_exceed_debt():
+    balances = {
+        1: 900.0,
+        2: -300.0,
+        3: -300.0,
+        4: -300.0,
+    }
+
+    result = greedy_settlement(balances)
+
+    assert result == [
+        (2, 1, 300.0),
+        (3, 1, 300.0),
+        (4, 1, 300.0),
+    ]
