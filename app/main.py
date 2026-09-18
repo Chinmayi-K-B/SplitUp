@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 from app.database import SessionLocal
@@ -23,6 +24,13 @@ app = FastAPI(
     title="SplitUp API",
     description="Group expense splitter for hostel and PG roommates",
     version="0.3.0",
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 def get_db():
     db = SessionLocal()
@@ -108,6 +116,18 @@ def create_user(user: User, db: Session = Depends(get_db)):
     db.commit()
 
     return user
+@app.get("/users")
+def get_users(db: Session = Depends(get_db)):
+    users = db.query(UserDB).all()
+
+    return [
+        {
+            "id": user.id,
+            "name": user.name,
+            "email": user.email,
+        }
+        for user in users
+    ]
 # ---------------------------------------------------------
 # Recurring Expense endpoints
 # ---------------------------------------------------------
@@ -412,6 +432,27 @@ def create_expense(
     db.commit()
 
     return expense
+
+@app.get("/expenses")
+def get_expenses(db: Session = Depends(get_db)):
+    expenses = (
+        db.query(ExpenseDB)
+        .order_by(ExpenseDB.created_at.desc())
+        .all()
+    )
+
+    return [
+        {
+            "id": expense.id,
+            "group_id": expense.group_id,
+            "description": expense.description,
+            "amount": expense.amount,
+            "paid_by": expense.paid_by,
+            "created_at": expense.created_at,
+            "is_recurring": bool(expense.is_recurring),
+        }
+        for expense in expenses
+    ]
 
 
 # ---------------------------------------------------------
