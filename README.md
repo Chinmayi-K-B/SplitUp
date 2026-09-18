@@ -1,4 +1,4 @@
-```markdown
+
 # SplitUp — Group Expense Splitter for Roommates
 
 SplitUp is a full-stack expense management application designed for hostel/PG roommates to track shared expenses, calculate balances, and generate practical settlement plans.
@@ -170,7 +170,3 @@ The current application supports local development and demonstration. Authentica
 ## Why This Project
 
 SplitUp was built around a common problem in hostel/PG life: keeping track of who paid for what and settling balances should not require spreadsheets, manual calculations, or searching through chat history.
-
-```
-
-```
